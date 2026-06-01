@@ -104,6 +104,17 @@ public:
   PlayerErrors loadMem(const std::string &uniqueName, unsigned char *mem,
                        int length, bool loadIntoMem, unsigned int &hash);
 
+  /// @brief If [mem]/[length] is an Ogg-Opus stream, decode it natively through
+  /// a BufferStream (reusing the streaming Opus decoder) and attach it to
+  /// [newSound]. SoLoud's Wav loader has no Opus decoder, so without this Opus
+  /// can only be played via the Dart-side buffer-stream workaround, which
+  /// decodes on the UI isolate. Because loadFile/loadMem run on a background
+  /// (compute) isolate, routing Opus here moves the decode off the UI thread.
+  /// @return true if it handled the buffer (caller must skip the Wav path);
+  /// [outErr] carries the result. Returns false (no-op) for non-Opus input.
+  bool tryLoadOpusBufferStream(unsigned char *mem, int length,
+                               ActiveSound *newSound, PlayerErrors &outErr);
+
   /// @brief Set up an audio stream.
   /// @param hash return the hash of the sound.
   /// @param maxBufferSize the max buffer size in bytes.

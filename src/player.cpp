@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstring>
+#include <fstream>
 #include <random>
+#include <vector>
 
 #ifdef _IS_WIN_
 #include <stddef.h> // for size_t
@@ -274,6 +276,74 @@ const std::string Player::getErrorString(PlayerErrors errorCode) const
     return "Other error";
 }
 
+// Scans [mem]/[length] for the Ogg-Opus signatures: the "OggS" capture pattern
+// at offset 0 and the "OpusHead" id header inside the first page. Only Opus is
+// diverted — Ogg-Vorbis / Ogg-FLAC / WAV / MP3 keep flowing through SoLoud's
+// Wav loader. The OpusHead header lives a few bytes into the first page, so a
+// short prefix scan is sufficient and cheap.
+static bool isOggOpus(const unsigned char *mem, int length)
+{
+    if (mem == nullptr || length < 8)
+        return false;
+    if (!(mem[0] == 'O' && mem[1] == 'g' && mem[2] == 'g' && mem[3] == 'S'))
+        return false;
+    const int scan = length < 512 ? length : 512;
+    for (int i = 0; i + 8 <= scan; ++i)
+    {
+        if (std::memcmp(mem + i, "OpusHead", 8) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool Player::tryLoadOpusBufferStream(
+    unsigned char *mem,
+    int length,
+    ActiveSound *newSound,
+    PlayerErrors &outErr)
+{
+    if (!isOggOpus(mem, length))
+        return false; // not Opus -> let the normal Wav/WavStream path run
+
+#if defined(NO_XIPH_LIBS)
+    outErr = xiphLibsNotFound;
+    return true;
+#else
+    // Build a PRESERVED, auto-detecting BufferStream — the same source type and
+    // settings the Dart-side workaround used, except the decode now happens in
+    // this (background/compute-isolate) call instead of on the UI isolate.
+    newSound->sound = std::make_unique<SoLoud::BufferStream>();
+    newSound->soundType = SoundType::TYPE_BUFFER_STREAM;
+    auto *stream = static_cast<SoLoud::BufferStream *>(newSound->sound.get());
+
+    // AUTO autodetects the Opus samplerate/channels from OpusHead; the 44100/2
+    // seed mirrors the values the Dart loader passed. maxBufferSize is a cap,
+    // not an allocation (mirrors the Dart loader's 200 MB headroom).
+    PCMformat fmt = {44100, 2, 4, BufferType::AUTO};
+    outErr = stream->setBufferStream(
+        this, newSound,
+        200u * 1024u * 1024u,
+        BufferingType::PRESERVED,
+        2.0f,
+        fmt, nullptr, nullptr);
+    if (outErr != noError)
+        return true;
+
+    // Feed the whole compressed buffer in one call, then signal end-of-data.
+    // setDataIsEnded() flushes the decoder so getLength() is final and the
+    // end-of-playback (handleIsNoMoreValid) event fires normally.
+    PlayerErrors addErr = stream->addData(mem, (unsigned int)length, false);
+    if (addErr != noError && addErr != pcmBufferFull)
+    {
+        outErr = addErr;
+        return true;
+    }
+    stream->setDataIsEnded();
+    outErr = noError;
+    return true;
+#endif
+}
+
 PlayerErrors Player::loadFile(
     const std::string &completeFileName,
     bool loadIntoMem,
@@ -303,6 +373,49 @@ PlayerErrors Player::loadFile(
     newSound.get()->completeFileName = std::string(completeFileName);
     *hash = newHash;
     newSound.get()->soundHash = newHash;
+
+    // Opus has no Wav-loader decoder. Cheaply sniff the file header; only if it
+    // is Ogg-Opus do we read the whole file and decode it natively through a
+    // BufferStream (off the UI isolate). Non-Opus files read just the prefix
+    // here and fall through to the unchanged Wav/WavStream path below.
+    {
+        std::ifstream f(completeFileName, std::ios::binary);
+        if (f)
+        {
+            unsigned char head[512];
+            f.read(reinterpret_cast<char *>(head), sizeof(head));
+            const int n = static_cast<int>(f.gcount());
+            if (isOggOpus(head, n))
+            {
+                f.clear();
+                f.seekg(0, std::ios::end);
+                const std::streamoff sz = f.tellg();
+                f.seekg(0, std::ios::beg);
+                std::vector<unsigned char> buf(static_cast<size_t>(sz));
+                f.read(reinterpret_cast<char *>(buf.data()), sz);
+
+                PlayerErrors opusErr;
+                if (tryLoadOpusBufferStream(buf.data(), static_cast<int>(buf.size()),
+                                            newSound.get(), opusErr))
+                {
+                    if (opusErr != noError)
+                    {
+                        *hash = 0;
+                        return opusErr;
+                    }
+                    *hash = newHash;
+                    newSound.get()->filters = std::make_unique<Filters>(&soloud, newSound.get(), nullptr);
+                    {
+                        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+                        sounds.push_back(std::move(newSound));
+                    }
+                    if (s != nullptr)
+                        return fileAlreadyLoaded;
+                    return noError;
+                }
+            }
+        }
+    }
 
     SoLoud::result result;
     // This function is never called when running on the Web, but [__WEB__] is checked for consistency with [loadMem].
@@ -372,6 +485,29 @@ PlayerErrors Player::loadMem(
     newSound.get()->completeFileName = std::string(uniqueName);
     hash = newHash;
     newSound.get()->soundHash = newHash;
+
+    // Opus has no Wav-loader decoder; decode it natively via a BufferStream so
+    // the work runs on this (compute-isolate) call rather than the UI isolate.
+    {
+        PlayerErrors opusErr;
+        if (tryLoadOpusBufferStream(mem, length, newSound.get(), opusErr))
+        {
+            if (opusErr != noError)
+            {
+                hash = 0;
+                return opusErr;
+            }
+            newSound.get()->filters = std::make_unique<Filters>(&soloud, newSound.get(), nullptr);
+            {
+                std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+                sounds.push_back(std::move(newSound));
+            }
+            if (s != nullptr)
+                return fileAlreadyLoaded;
+            return noError;
+        }
+    }
+
     SoLoud::result result;
     if (loadIntoMem || __WEB__)
     {
