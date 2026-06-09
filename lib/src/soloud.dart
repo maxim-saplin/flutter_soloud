@@ -22,6 +22,27 @@ import 'package:http/http.dart' as http;
 import 'package:logging/logging.dart';
 import 'package:meta/meta.dart';
 
+import 'dart:isolate';
+
+@pragma('vm:entry-point')
+void _persistentWorkerIsolateFn(SendPort initSendPort) {
+  final receivePort = ReceivePort();
+  initSendPort.send(receivePort.sendPort);
+
+  receivePort.listen((message) {
+    if (message is Map<String, dynamic>) {
+      final type = message['type'] as String;
+      if (type == 'loadFile') {
+        _loadFile(message);
+      } else if (type == 'loadMem') {
+        final ret = _loadMem(message);
+        final replyPort = message['replyPort'] as SendPort;
+        replyPort.send(ret);
+      }
+    }
+  });
+}
+
 @pragma('vm:entry-point')
 void _loadFile(Map<String, dynamic> args) {
   SoLoudController().soLoudFFI.loadFile(
@@ -146,6 +167,9 @@ interface class SoLoud {
 
   /// The controller.
   final _controller = SoLoudController();
+
+  SendPort? _persistentWorkerPort;
+  Isolate? _persistentWorkerIsolate;
 
   /// This can be used to access all the available filter functionalities
   /// for the player output (formerly called global filters).
@@ -348,6 +372,12 @@ interface class SoLoud {
     final nativeIsInitialized = _controller.soLoudFFI.isInited();
     _log.finest('init() called');
 
+    if (!kIsWeb && _persistentWorkerPort == null) {
+      final receivePort = ReceivePort();
+      _persistentWorkerIsolate = await Isolate.spawn(_persistentWorkerIsolateFn, receivePort.sendPort);
+      _persistentWorkerPort = await receivePort.first as SendPort;
+    }
+
     // Removing these asserts because they could not be true after a
     // hot restart or after calling deinit(). Discussed in #452.
     // Making extra sure no state is dangling after a hot-restart.
@@ -455,6 +485,11 @@ interface class SoLoud {
   /// or inside "AppLifecycleListener.onExitRequested".
   void deinit() {
     _log.finest('deinit() called');
+
+    _persistentWorkerIsolate?.kill();
+    _persistentWorkerIsolate = null;
+    _persistentWorkerPort = null;
+
     _nativeCallbacksInitialized = false;
     _controller.soLoudFFI.disposeNativeCallables();
     _controller.soLoudFFI.disposeAllSound();
@@ -670,11 +705,17 @@ interface class SoLoud {
     // we use a counter.
     loadedFileCompleters.addAll({'$path-$counter': completer});
 
-    await compute(_loadFile, {
+    final payload = {
+      'type': 'loadFile',
       'path': path,
       'mode': effectiveMode.index,
       'counter': counter,
-    });
+    };
+    if (!kIsWeb && _persistentWorkerPort != null) {
+      _persistentWorkerPort!.send(payload);
+    } else {
+      await compute(_loadFile, payload);
+    }
 
     return completer.future
         .whenComplete(() {
@@ -751,11 +792,25 @@ interface class SoLoud {
             sampleRate: _sampleRate,
             channels: _channels,
           )
-        : await compute(_loadMem, {
-            'path': path,
-            'buffer': buffer,
-            'mode': effectiveMode.index,
-          });
+        : await () async {
+            if (_persistentWorkerPort != null) {
+              final replyPort = ReceivePort();
+              _persistentWorkerPort!.send({
+                'type': 'loadMem',
+                'path': path,
+                'buffer': buffer,
+                'mode': effectiveMode.index,
+                'replyPort': replyPort.sendPort,
+              });
+              return await replyPort.first as ({PlayerErrors error, SoundHash soundHash});
+            } else {
+              return await compute(_loadMem, {
+                'path': path,
+                'buffer': buffer,
+                'mode': effectiveMode.index,
+              });
+            }
+          }();
 
     /// There is not a callback in cpp that is supposed to add the
     /// "load file event". Manually send this event to have only one
