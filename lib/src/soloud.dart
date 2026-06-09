@@ -643,6 +643,12 @@ interface class SoLoud {
     if (!isInitialized) {
       throw const SoLoudNotInitializedException();
     }
+    
+    // B-049: Opus is extremely CPU intensive to decode into RAM via LoadMode.memory,
+    // so we force LoadMode.disk natively for .opus files to avoid choking isolates and crashing.
+    if (path.toLowerCase().endsWith('.opus')) {
+      mode = LoadMode.disk;
+    }
 
     final completer = Completer<AudioSource>();
     final counter = _currentLoadCounter++;
@@ -723,6 +729,11 @@ interface class SoLoud {
   }) async {
     if (!isInitialized) {
       throw const SoLoudNotInitializedException();
+    }
+
+    // B-049: Force LoadMode.disk for Opus natively to avoid choking RAM and isolates
+    if (path.toLowerCase().endsWith('.opus')) {
+      mode = LoadMode.disk;
     }
 
     final completer = Completer<AudioSource>();
