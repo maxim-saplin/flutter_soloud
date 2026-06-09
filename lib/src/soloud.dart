@@ -644,10 +644,11 @@ interface class SoLoud {
       throw const SoLoudNotInitializedException();
     }
     
-    // B-049: Opus is extremely CPU intensive to decode into RAM via LoadMode.memory,
-    // so we force LoadMode.disk natively for .opus files to avoid choking isolates and crashing.
+    // B-049: Opus is extremely CPU intensive to decode into RAM.
+    // Force LoadMode.disk natively for .opus files to avoid choking isolates.
+    var effectiveMode = mode;
     if (path.toLowerCase().endsWith('.opus')) {
-      mode = LoadMode.disk;
+      effectiveMode = LoadMode.disk;
     }
 
     final completer = Completer<AudioSource>();
@@ -671,7 +672,7 @@ interface class SoLoud {
 
     await compute(_loadFile, {
       'path': path,
-      'mode': mode.index,
+      'mode': effectiveMode.index,
       'counter': counter,
     });
 
@@ -731,9 +732,11 @@ interface class SoLoud {
       throw const SoLoudNotInitializedException();
     }
 
-    // B-049: Force LoadMode.disk for Opus natively to avoid choking RAM and isolates
+    // B-049: Force LoadMode.disk for Opus natively to avoid choking RAM and
+    // isolate workers.
+    var effectiveMode = mode;
     if (path.toLowerCase().endsWith('.opus')) {
-      mode = LoadMode.disk;
+      effectiveMode = LoadMode.disk;
     }
 
     final completer = Completer<AudioSource>();
@@ -744,14 +747,14 @@ interface class SoLoud {
         ? await _loadMemWeb(
             path: path,
             buffer: buffer,
-            mode: mode,
+            mode: effectiveMode,
             sampleRate: _sampleRate,
             channels: _channels,
           )
         : await compute(_loadMem, {
             'path': path,
             'buffer': buffer,
-            'mode': mode.index,
+            'mode': effectiveMode.index,
           });
 
     /// There is not a callback in cpp that is supposed to add the
